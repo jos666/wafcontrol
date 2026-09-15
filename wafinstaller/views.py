@@ -438,18 +438,17 @@ class CRSRuleListView(LoginRequiredMixin, TemplateView):
         version = get_crs_full_version()
         rule_dir = get_rules_dir(version)
         files = []
-        rule_error = ""
         try:
             if rule_dir and os.path.isdir(rule_dir):
                 for filename in sorted(os.listdir(rule_dir)):
                     if filename.endswith((".conf", ".data")):
                         files.append(filename)
             else:
-                rule_error = f"Directory not found: {rule_dir}"
+                files.append(f"[Directory not found]: {rule_dir}")
         except Exception as e:
-            rule_error = str(e)
+            files.append(f"[Error]: {str(e)}")
 
-        context.update({"crs_version": version, "rule_files": files, "rule_error": rule_error})
+        context.update({"crs_version": version, "rule_files": files})
         return context
 
 
@@ -896,20 +895,38 @@ class CustomRulesView(LoginRequiredMixin, View):
 
         path = _custom_after_path(version)
         rules = []
+        pattern = re.compile(r'SecRule\s+([^\s]+)\s+"([^"]+)"\s+"([^"]*)"')
         try:
             with open(path, "r") as f:
                 for line in f:
                     line = line.strip()
                     if line.startswith("SecRule"):
-                        match = RULE_PATTERN.match(line)
+                        #match = RULE_PATTERN.match(line)
+                        match = pattern.match(line)
                         if match:
+                            m = match
+                            target = m.group(1)     # REQUEST_HEADERS:Host
+                            operator = m.group(2)   # @rx 192.168.10.*
+                            actions1 = m.group(3)    # id:300000,phase:1,allow,nolog,...
+                            # 第二步：从动作串里提取具体字段
+                            rule_id = re.search(r'id:(\d+)', actions1)
+                            phase = re.search(r'phase:(\d+)', actions1)
+                            msg = re.search(r"msg:'([^']*)'", actions1)
+                            # 提取所有动作（不是键值对形式的）
+                            action_keywords = re.findall(r'\b(deny|pass|allow|drop|log|nolog)\b', actions1)
                             rule = {
-                                "variable": match.group(1),
-                                "operator": match.group(2),
-                                "id": match.group(3),
-                                "phase": match.group(4),
-                                "action": match.group(5),
-                                "comment": match.group(6) if match.lastindex >= 6 else "",
+                                #"variable": match.group(1),
+                                #"operator": match.group(2),
+                                #"id": match.group(3),
+                                #"phase": match.group(4),
+                                #"action": match.group(5),
+                                #"comment": match.group(6) if match.lastindex >= 6 else "",
+                                "variable": target,
+                                "operator": operator,
+                                "id": rule_id.group(1) if rule_id else None,
+                                "phase": phase.group(1) if phase else None,
+                                "action": ",".join(action_keywords),
+                                "comment": msg.group(1) if msg else None,
                             }
                             if "severity:" in line:
                                 rule["severity"] = self._extract_value(line, "severity")
