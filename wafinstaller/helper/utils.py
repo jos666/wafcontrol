@@ -25,6 +25,8 @@ def get_country_info(ip_address: str):
             response = reader.country(ip_address)
             country_name = response.country.name or "Unknown"
             iso_code = response.country.iso_code.lower() if response.country.iso_code else "xx"
+            if ip_address.startswith("172.16") or ip_address.startswith("192.168") or ip_address.startswith("10.8"):
+                country_name = "Private"
             return {"country": country_name, "iso_code": iso_code}
     except Exception:
         return {"country": "Unknown", "iso_code": "xx"}
