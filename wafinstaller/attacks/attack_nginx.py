@@ -1,8 +1,9 @@
 # Detect Attack When Nginx Webserver in Enabled
-import os, re, io, glob, stat, json, hashlib, time
+import os, re, io, glob, stat, json, hashlib, time, tempfile, logging
 from ipaddress import ip_address
 from typing import Dict, List, Optional, Tuple
 
+logger = logging.getLogger("attack_nginx")
 JSON_TXN_KEYS = ("transaction", "messages")
 
 SECTION_A_HEADER = re.compile(r'^\[(?P<ts>[^]]+)\]\s+(?P<uid>\S+)\s+(?P<src>[0-9A-Fa-f:.]+)\s+(?P<src_port>\d+)\s+(?P<dst>[0-9A-Fa-f:.]+)\s+(?P<dst_port>\d+)\s*$')
@@ -234,6 +235,143 @@ def parse_audit_blocks_incremental(audit_path: str, ckpt: dict, max_tail_bytes: 
         if start != prev.get("offset") and max_blocks_on_rotate > 0: blocks = blocks[-max_blocks_on_rotate:]
     ck = ckpt.setdefault("audit_files", {}); ck[audit_path] = {"inode": inode, "offset": size}
     return blocks
+
+META_FILE = "/tmp/read_meta"
+
+def _load_meta(path: str) -> dict:
+    """读取上次记录的读取位置"""
+    try:
+        if os.path.exists(META_FILE):
+            with open(META_FILE, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+                # 只认同一个文件的记录
+                if meta.get("file") == path:
+                    return meta
+    except Exception:
+        pass
+    return {}
+
+def _save_meta(path: str, offset: int, inode: int):
+    """保存当前读取位置，原子写入避免损坏"""
+    meta = {"file": path, "offset": offset, "inode": inode}
+    dir_name = os.path.dirname(META_FILE) or "/tmp"
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".read_meta_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        os.replace(tmp_path, META_FILE)
+    except Exception:
+        pass
+
+def read_audit_json(path: str) -> List[dict]:
+    if not os.path.exists(path):
+        return []
+    try:
+        stat = os.stat(path)
+        size = stat.st_size
+        inode = stat.st_ino
+    except Exception:
+        return []
+
+    meta = _load_meta(path)
+    if meta.get("inode") != inode or meta.get("offset", 0) > size:
+        start = 0
+    else:
+        start = meta.get("offset", 0)
+    if not meta:
+        start = 0
+    ret_data = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            if start:
+                f.seek(start)
+            for line in f:
+                try:
+                    d = json.loads(line.strip())
+                    transaction = d.get('transaction',{})
+                    data = {}
+                    if not transaction.get("messages",[]): # 不是modsecurity 拦截的日志
+                        continue
+                    data['ip'] = transaction.get('client_ip')
+                    data['host'] = transaction.get('host_ip')
+                    data['full_uri'] = transaction.get("request",{}).get("hostname",'') + ":" + str(transaction.get("host_port"))+ transaction.get("request",{}).get("uri")
+                    data['rid'] = transaction.get("messages", [{}])[0].get("details",{}).get("ruleId")
+                    data['ver'] =  transaction.get("messages", [{}])[0].get("details",{}).get("ver")
+                    data['ref'] =  transaction.get("messages", [{}])[0].get("details",{}).get("reference")
+                    data['severity'] = transaction.get("messages", [{}])[0].get("details",{}).get("severity")
+                    data["message"] =  transaction.get("messages", [{}])[0].get("details",{}).get("match", '')
+                    d = transaction.get("messages", [])[0].get("details",{}).get("data", '')
+                    if d:
+                        data["message"] += " :"+d
+
+                    for i in transaction.get("messages", []):
+                        if "Total Score" in i.get("message", ""):
+                            data['anomaly_score'] = extract_anomaly_score(i.get("message", ""))
+
+                    if not data['anomaly_score']:
+                        data['anomaly_score'] = 0
+                    ret_data.append(data)
+                    #DATA['anomaly_score'] = transaction.get("messages", [])[0].get("details",{}).get("")
+                except:
+                    logger.error(f"parse json error {line}", exc_info=True)
+            _save_meta(path, f.tell(), inode) 
+    except:
+        logger.error("err", exc_info=True)
+    return ret_data
+
+def read_audit_blocks_json(path: str, max_bytes: int = 8_000_000) -> List[str]:
+    if not os.path.exists(path):
+        return []
+
+    try:
+        stat = os.stat(path)
+        size = stat.st_size
+        inode = stat.st_ino
+    except Exception:
+        return []
+
+    meta = _load_meta(path)
+
+    # 如果 inode 变了（文件被轮转/重建），或者记录的位置大于当前文件大小，说明文件已经换了
+    if meta.get("inode") != inode or meta.get("offset", 0) > size:
+        start = 0
+    else:
+        start = meta.get("offset", 0)
+
+    # 如果剩余内容超过 max_bytes，只读最后 max_bytes，避免一次性读太多
+    if size - start > max_bytes:
+        start = size - max_bytes
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            if start:
+                f.seek(start)
+            lines = f.read().splitlines()
+            new_offset = f.tell()
+    except Exception:
+        return []
+
+    blocks, cur_id, cur_lines = [], None, []
+    for ln in lines:
+        mA = MARKER_A_DBL.match(ln)
+        if mA:
+            if cur_id is not None and cur_lines:
+                blocks.append("\n".join(cur_lines))
+            cur_id, cur_lines = mA.group(1), [ln]
+            continue
+        if cur_id is not None:
+            cur_lines.append(ln)
+    # 最后一块先不结束，因为可能被截断，留到下次读时再补全
+    # 但为了保持原有行为，这里仍然返回，只是把 offset 设为最后一个完整块的结束位置
+    if cur_id is not None and cur_lines:
+        # 如果这是最后一块，它可能不完整，先把 offset 倒退到这块开头，下次从这块头开始重读
+        last_block_start = lines.index(cur_lines[0]) if cur_lines[0] in lines else 0
+        new_offset = start + len("\n".join(lines[:last_block_start])) + (1 if last_block_start > 0 else 0)
+
+    _save_meta(path, new_offset, inode)
+    #print(blocks)
+    return blocks
+    
 
 def read_audit_blocks_serial_without_z(path: str, max_bytes: int = 8_000_000) -> List[str]:
     if not os.path.exists(path): return []
@@ -522,7 +660,7 @@ def extract_severity_from_log(block: str, rid: str) -> int:
             return 2
         elif family == "920":  # Protocol anomalies
             return 1
-        elif family in ("949", "959", "980"):  # Anomaly score rules
+        elif family == "949":  # Anomaly score rules
             return 0
 
     return 2  # Default medium
